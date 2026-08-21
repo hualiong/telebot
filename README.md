@@ -44,7 +44,7 @@ telebot/
 
 ### Prerequisites
 
-- [Node.js](https://nodejs.org/) v18+ (or [Bun](https://bun.sh/))
+- [Node.js](https://nodejs.org/) v18+
 - A [Cloudflare account](https://dash.cloudflare.com/sign-up)
 - A Telegram bot token from [@BotFather](https://t.me/BotFather)
 

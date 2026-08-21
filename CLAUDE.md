@@ -8,7 +8,7 @@ This is a Telegram bot starter running on Cloudflare Workers with Telegraf. This
 - **Bot Framework**: Telegraf v4 (Telegram Bot API wrapper)
 - **Language**: TypeScript (strict mode, ES2022 target)
 - **Build/Deploy**: Wrangler CLI
-- **Package Manager**: npm or bun (both lock files may exist)
+- **Package Manager**: npm (package-lock.json)
 
 ## Project Structure
 

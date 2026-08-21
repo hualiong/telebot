@@ -1,3 +1,5 @@
+import type { ExecutionContext, ScheduledEvent } from "@cloudflare/workers-types";
+
 import { Bot } from "./src/bot";
 import { getConfig } from "./src/config";
 import { logger } from "./src/utils/logger";

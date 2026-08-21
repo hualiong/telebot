@@ -1,7 +1,7 @@
 {
   "compilerOptions": {
     "target": "ES2022",
-    "lib": ["ES2022"],
+    "lib": ["dom", "ES2022"],
     "module": "ES2022",
     "moduleResolution": "bundler",
     "allowSyntheticDefaultImports": true,
@@ -13,8 +13,7 @@
     "verbatimModuleSyntax": true,
     "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true,
-    "isolatedModules": true,
-    "types": ["@cloudflare/workers-types"]
+    "isolatedModules": true
   },
   "include": ["**/*.ts"],
   "exclude": ["node_modules", "dist"]

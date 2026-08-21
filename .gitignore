@@ -28,5 +28,5 @@ coverage/
 *.tsbuildinfo
 
 # Lock files (keep your preferred one)
-# package-lock.json
+package-lock.json
 # bun.lock
