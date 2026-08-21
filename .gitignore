@@ -1,0 +1,32 @@
+node_modules/
+dist/
+.wrangler/
+.dev.vars
+wrangler.dev.toml
+
+# Logs
+*.log
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test coverage
+coverage/
+*.lcov
+
+# TypeScript
+*.tsbuildinfo
+
+# Lock files (keep your preferred one)
+# package-lock.json
+# bun.lock
