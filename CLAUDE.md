@@ -287,10 +287,15 @@ so a push is also a production deploy, and whatever is committed *is* what goes 
 - `build_command` is deliberately empty; `wrangler deploy` bundles TypeScript itself via esbuild.
 - **`package-lock.json` must stay committed** — it was previously gitignored, which made every
   build resolve dependencies from scratch.
-- Deploying with `wrangler deploy` locally and via the Git build both work; the Git build does
-  **not** carry over anything uncommitted, so `git status` must be clean before pushing.
-- Verify a build with `GET https://telebot.hualiang.fun/` (or `wrangler versions list`) after
-  pushing; the version ID in the Cloudflare dashboard should change.
+- The Git build does **not** carry over anything uncommitted, so `git status` must be clean
+  before pushing.
+- Verify with `GET https://telebot.hualiang.fun/`; the version ID should change.
+
+⚠️ **When querying builds via the API, use the script *tag*, not the Worker name.** The correct
+path is `/accounts/{id}/builds/workers/{script_tag}/builds` where `script_tag` is the value from
+`GET /workers/scripts` (a hex tag, *not* `"telebot"`). Querying with the Worker name returns an
+empty array — which looks exactly like "no builds exist" and is easy to misread as a missing
+trigger. The trigger has existed since 2026-08-21 and fires correctly on `push_event`.
 
 ### Operating notes
 
