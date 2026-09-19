@@ -1,2 +1,18 @@
-# Telegram Bot Token from @BotFather
+# 本地开发用（这份是模板，真实值放 .dev.vars，已被 .gitignore 忽略）
+# 复制为 .dev.vars 后再填：
+
+# Telegram Bot Token（从 @BotFather 获取），生产环境用：
+#   npx wrangler secret put BOT_TOKEN
 BOT_TOKEN=
+
+# 白名单 Telegram user id（可选）。不设置则不限制；生产环境放 wrangler.jsonc 的 [vars]
+# OWNER_CHAT_ID=123456789
+
+# acPasstoken 覆盖值（可选）。不设置时会从 STATE_KV（= cloud-mail namespace）
+# 的 `token` 键自动读取，那个值由 acfun-sign-in Worker 定期轮换，
+# 所以正常情况下**不需要**这一项。仅当想绕过 KV 时才设置：
+# ACFUN_COOKIE=
+
+# Telegram API 根地址（可选）。**只给离线测试用**：把请求指向本地假服务器，
+# 免得 flow-check 意外打到真的 api.telegram.org。生产环境永远不要设置。
+# TELEGRAM_API_ROOT=http://127.0.0.1:8081

@@ -1,0 +1,15 @@
+# 仓库统一用 LF 行尾。
+# 否则 Windows 上编辑会写入 CRLF，而 Cloudflare 构建跑在 Linux 上，
+# 同一份文件在不同机器上产生不同 diff / 不同 hash。
+* text=auto eol=lf
+
+# 二进制文件不要做行尾转换
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.ico binary
+*.woff binary
+*.woff2 binary
+
+# lockfile 是机器生成的，不要出现在 diff 里，也不参与 merge
+package-lock.json -diff linguist-generated

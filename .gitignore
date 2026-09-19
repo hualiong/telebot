@@ -24,9 +24,13 @@ Thumbs.db
 coverage/
 *.lcov
 
+# scripts/flow-check.mjs 需要 esbuild 先打包才能跑，产物不入库
+scripts/.flow-check.bundle.cjs
+scripts/.flow-check.bundle.mjs
+
 # TypeScript
 *.tsbuildinfo
 
-# Lock files (keep your preferred one)
-package-lock.json
-# bun.lock
+# 注意：package-lock.json **必须入库** —— Cloudflare 的 Git 构建会用 `npm install`
+# 复现依赖，没有 lockfile 就每次装到不同版本，构建结果不可复现。
+# （原来这里把它忽略了，已移除。）

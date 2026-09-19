@@ -7,5 +7,11 @@
   ],
   "observability": {
     "enabled": true
-  }
+  },
+  "kv_namespaces": [
+    {
+      "binding": "STATE_KV",
+      "id": "441e17faef8e4a66b6f7b6fb04b9363f"
+    }
+  ]
 }
