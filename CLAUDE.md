@@ -194,7 +194,15 @@ ticket is its own key and only exists after a failure, so it doesn't contend wit
 3. `moment/add`'s `params` must be encoded via `URLSearchParams`, never a hand-built JSON body.
 4. `moment/add` is rate limited to roughly 1 post per few minutes → `result: 140011`.
 5. On any `moment/add` failure, log the **raw response body** — it's the only diagnostic.
-6. `imgs[]` needs `{url, width, height}`. `photo` messages give both in the metadata; `document`
+6. The published moment's **web** URL is `https://www.acfun.cn/moment/am<momentId>` — note the
+   `am` prefix (momentId `5091765` → `/moment/am5091765`). ⚠️ Do **not** use the App-side address
+   `https://m.acfun.cn/communityCircle/moment/<id>`: it is a different host and path, and opening
+   it in a browser is wrong. The response's `shareUrl` is treated as **untrusted** — it may carry
+   share/utm parameters or point at that App address — so it is only used when it already matches
+   `https://www.acfun.cn/moment/`, and the URL is otherwise derived from `momentId`. The
+   `动态已发布` log line records `source: "api" | "derived"` plus the raw `apiShareUrl`, which is
+   the only way to tell which branch ran.
+7. `imgs[]` needs `{url, width, height}`. `photo` messages give both in the metadata; `document`
    messages (what forwarding often produces) have neither, so `imageSize()` reads them out of
    the file header — JPEG (incl. EXIF orientation 5–8, which swaps them), PNG and WebP.
    Only JPEG/PNG/WebP are accepted; the detected format also sets the upload filename extension,
@@ -312,7 +320,8 @@ npx esbuild scripts/flow-check.mjs --bundle --platform=node --format=cjs \
 
 ⚠️ **`flow-check.mjs` is the only verification available on this machine** (`wrangler tail` and
 the Observability API both fail here — see Operating notes). It covers the whitelist, the happy
-path, oversize, `document`+PNG, dedupe, the 9-photo publish, **and the whole retry surface**:
+path, oversize, `document`+PNG, dedupe, the 9-photo publish (**including the `/moment/am<id>` URL
+and the case where AcFun's `shareUrl` is the wrong App address**), **and the whole retry surface**:
 failure-edits-in-place, blockquote + raw `error_msg`, button presence, `callback_data` ≤ 64 bytes,
 a successful retry, a retry that fails again, ticket single-use, and non-owner taps. When you
 touch `photo.ts`, `markdown.ts`, `retry.ts`, `acfun.ts` or `commands.ts`, run it before pushing —

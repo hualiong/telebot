@@ -194,7 +194,7 @@ async function run(label, message, opts = {}) {
 			}
 			if (url.includes("resume")) return json({ result: 1, existed: false, fragment_index: -1 });
 			if (url.includes("moment/add")) {
-				return json({ result: 0, moment: { momentId: 999, shareUrl: "https://m.acfun.cn/communityCircle/moment/999" } });
+				return json({ result: 0, moment: { momentId: 999, shareUrl: opts.apiShareUrl ?? "https://www.acfun.cn/moment/am999" } });
 			}
 			return json({ result: 1 });
 		}
@@ -367,9 +367,33 @@ const cmd = (text) => ({ text, entities: [{ type: "bot_command", offset: 0, leng
 		},
 	);
 	const published = sends.find((s) => s.includes("新动态已发布")) ?? "";
-	check("发布文案为「🎉 新动态已发布 · 查看」", /🎉 \*新动态已发布\* · \[查看\]\(https:\/\/m\.acfun\.cn\//.test(published), JSON.stringify(published));
+	check("发布链接是网页版 /moment/am<id>", /\(https:\/\/www\.acfun\.cn\/moment\/am999\)/.test(published), JSON.stringify(published));
+	check("不再用 App 端的 communityCircle 地址", !published.includes("communityCircle") && !published.includes("m.acfun.cn"), JSON.stringify(published));
 	check("不再出现「已发布 9 图动态」", !sends.some((s) => s.includes("9 图动态")));
 	check("不再出现「在 AcFun 查看」", !sends.some((s) => s.includes("在 AcFun 查看")));
+}
+
+// ---- 8b. API 给的 shareUrl 不对时，必须按 momentId 自己拼网页地址 ----
+// 真实故障场景：moment/add 响应里的 shareUrl 指向 App 端地址，
+// 一旦无条件采用，Telegram 里就会出现打不开的错链接。
+{
+	const { sends } = await run(
+		"shareUrl 指向 App 端地址",
+		baseMsg({ photo: [{ file_id: "f", file_unique_id: "ninth-b", width: 800, height: 600, file_size: 9000 }] }),
+		{
+			apiShareUrl: "https://m.acfun.cn/communityCircle/moment/999",
+			seedCollection: {
+				images: Array.from({ length: 8 }, (_, i) => ({
+					url: `https://imgs.aixifan.com/newUpload/1_fakeb${i}.jpg`,
+					width: 800, height: 600, size: 9000, fileId: `fb${i}`, at: Date.now(),
+				})),
+				chatId: OWNER,
+			},
+		},
+	);
+	const published = sends.find((s) => s.includes("新动态已发布")) ?? "";
+	check("忽略 App 端 shareUrl，改用 am 地址", /\(https:\/\/www\.acfun\.cn\/moment\/am999\)/.test(published), JSON.stringify(published));
+	check("错链接没有漏进消息", !published.includes("communityCircle"), JSON.stringify(published));
 }
 
 // ---- 9. 上传失败：就地编辑（不新发消息）+ 引用块 + 重试按钮 ----

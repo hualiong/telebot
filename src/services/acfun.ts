@@ -303,8 +303,28 @@ export async function postMoment(
 		throw err;
 	}
 
-	const shareUrl = j.moment?.shareUrl ?? `https://m.acfun.cn/communityCircle/moment/${j.moment?.momentId}`;
-	logger.info("动态已发布", { momentId: j.moment?.momentId, shareUrl });
+	// 动态的**网页版**地址。注意 id 带 `am` 前缀：
+	//   momentId 5091765  →  https://www.acfun.cn/moment/am5091765
+	// 别跟 App 端那套 `m.acfun.cn/communityCircle/moment/<id>` 混了 —— 那是另一个
+	// 域名下的另一条路径，在网页端打开是不对的。
+	//
+	// ⚠️ 不能无条件相信响应里的 `shareUrl`：它可能带 utm/分享参数，也可能指向 App 端
+	//    的那个地址（正是这个字段会把错误的链接塞进 Telegram）。所以只在它已经是
+	//    规范的网页地址时才采用，否则一律按 momentId 自己拼。
+	const webUrl = (id: unknown): string | null =>
+		typeof id === "number" ? `https://www.acfun.cn/moment/am${id}` : null;
+	const apiShareUrl =
+		typeof j.moment?.shareUrl === "string" && /^https:\/\/www\.acfun\.cn\/moment\//.test(j.moment.shareUrl)
+			? j.moment.shareUrl
+			: null;
+	const shareUrl = apiShareUrl ?? webUrl(j.moment?.momentId) ?? "";
+	// 记下用的是哪一个：这条日志是判断「API 到底给没给 shareUrl、给的对不对」的唯一依据
+	logger.info("动态已发布", {
+		momentId: j.moment?.momentId,
+		shareUrl,
+		source: apiShareUrl ? "api" : "derived",
+		apiShareUrl: j.moment?.shareUrl ?? null,
+	});
 	return {
 		momentId: j.moment?.momentId,
 		shareUrl,
