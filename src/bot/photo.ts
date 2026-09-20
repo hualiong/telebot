@@ -5,7 +5,13 @@ import { getAcfunToken, hasSeen, loadCollection, markSeen } from "../services/co
 import { collectImage, flushIfReady, QUOTA } from "../services/poster";
 import { logger } from "../utils/logger";
 import { formatBeijingTime } from "../utils/time";
-import { escapeMarkdown, formatBytes, imageLink, sendWithFallback } from "../utils/markdown";
+import { formatBytes, htmlBlockquote, imageLink, sendWithFallback } from "../utils/markdown";
+import {
+	consumeTicket,
+	type RetryTicket,
+	retryCallbackData,
+	saveTicket,
+} from "../utils/retry";
 import type { AcfunImage } from "../types/acfun";
 
 export interface PhotoDeps {
@@ -22,8 +28,6 @@ const MAX_BYTES = 1048576;
 
 /** 收到即回执，但同一媒体组（相册）只回一条。isolate 级缓存，够用且零成本。 */
 const albumReceipted = new Set<string>();
-
-const describe = (error: any): string => String(error?.message ?? error);
 
 type PhotoSize = {
 	file_id: string;
@@ -190,13 +194,244 @@ export function imageSize(
 }
 
 /**
- * 处理一条带照片的消息 —— "一条进，两条出"（凑满 9 张时是三条）。
+ * 消息发送器：一次装配，之后所有文案都走同一个出口，
+ * 免得每个提示各拼一遍 `parse_mode` / 链接预览这类容易写错的参数。
+ *
+ * `sendText` 会返回发出的 message_id（失败返回 null），因为**首次上传**是
+ * 「先发回执、再就地改写」，必须拿到这个 id；重试时消息已经存在，用不上。
+ */
+interface Sender {
+	sendText(text: string, options?: { mode?: "Markdown" | "HTML"; link?: boolean }): Promise<number | null>;
+	editText(
+		messageId: number,
+		text: string,
+		options?: { mode?: "Markdown" | "HTML"; link?: boolean; replyMarkup?: unknown },
+	): Promise<void>;
+}
+
+function makeSender(ctx: Context, chatId: number): Sender {
+	const call = (text: string, options: Record<string, unknown>) =>
+		(ctx.telegram.sendMessage as any)(chatId, text, options) as Promise<any>;
+
+	const sendText: Sender["sendText"] = async (text, options = {}) => {
+		let messageId: number | null = null;
+		await sendWithFallback(async (t, extra) => {
+			const sent = await call(t, extra);
+			messageId = sent?.message_id ?? null;
+		}, text, options);
+		return messageId;
+	};
+
+	const editText: Sender["editText"] = async (messageId, text, options = {}) => {
+		await sendWithFallback((t, extra) => {
+			const payload: Record<string, unknown> = { ...extra };
+			if (options.replyMarkup !== undefined) payload.reply_markup = options.replyMarkup;
+			return (ctx.telegram.editMessageText as any)(chatId, messageId, undefined, t, payload);
+		}, text, options);
+	};
+
+	return { sendText, editText };
+}
+
+/** 失败提示里的行动建议：首次失败让用户重发，点了重试再失败就只能再点一次。 */
+const retryHint = (fresh: boolean): string =>
+	fresh ? "❌ 把这张图重发一次即可。" : "❌ 再点一次上面的按钮即可重试。";
+
+/**
+ * 上传一张图的完整流程 —— 首次发送与「重试按钮」**共用这一份**。
+ *
+ * 抽出来是这次改动的核心：重试本质上就是「拿同一张图再跑一遍上传」，
+ * 若各写一份，两条路径的校验、报错文案、落库逻辑迟早会漂移。
+ *
+ * 全程串行，理由见 `handlePhoto` 上方的说明。
+ *
+ * @param fresh 首次处理（true）还是点了重试按钮（false）。
+ *              fresh 会先发回执并自行取得 message_id；重试则复用那条失败消息
+ *              的 message_id（它此时正显示着报错），直接改写。
+ */
+async function runUpload(
+	ctx: Context,
+	chatId: number,
+	photo: { file_id: string; file_unique_id: string; width: number; height: number },
+	isDocument: boolean,
+	fresh: boolean,
+	receiptId: number | null,
+	deps: PhotoDeps,
+): Promise<void> {
+	const send = makeSender(ctx, chatId);
+
+	/** 回执的 message_id —— 拿到它之后，结果与报错都靠「编辑这条」来呈现。 */
+	let targetId = receiptId;
+	/** 是否已进入「上传 AcFun」这一步；回滚去重标记只该在这一步之后做。 */
+	let attempted = false;
+
+	// 这三个在 catch 里还要用来存「重试门票」，所以**必须在 try 外声明**；
+	// 若留在 try 内，成功路径不会有问题，但 catch 分支会直接编译不过（或更糟：值丢失）。
+	let width = photo.width;
+	let height = photo.height;
+	let ext = "jpg";
+
+	try {
+		// ① 下载
+		const link = await ctx.telegram.getFileLink(photo.file_id);
+		const res = await fetch(link.toString());
+		if (!res.ok) throw new Error(`下载失败 HTTP ${res.status}`);
+		const bytes = new Uint8Array(await res.arrayBuffer());
+
+		if (bytes.length > MAX_BYTES) {
+			await send.sendText(oversizeHint(bytes.length));
+			return;
+		}
+
+		// ② 尺寸。
+		//    `photo` 路径 Telegram 直接给了宽高；`document` 路径（转发常见）没有，
+		//    只能从文件头读，顺便认出真实格式 —— 扩展名会影响 AcFun 返回的直链后缀。
+		if (isDocument || !width || !height) {
+			const size = imageSize(bytes);
+			if (!size) {
+				await send.sendText(
+					"⚠️ 认不出这个图片格式（支持 JPEG / PNG / WebP），AcFun 的接口需要宽高。\n" +
+						"可以改用「照片」方式发送，或先转成 JPEG。",
+				);
+				return;
+			}
+			({ width, height } = size);
+			ext = size.ext;
+		}
+
+		// ③ 回执。首次才发新消息；重试时那条消息正显示着报错，反复重发会刷屏。
+		if (fresh) {
+			targetId = await send.sendText("📥 收到，正在上传…");
+		}
+
+		// ④ 上传 AcFun，换持久直链（5 个子请求）
+		attempted = true;
+		const cookie = buildCookie(
+			await getAcfunToken(deps.stateKv, deps.cookieOverride),
+		);
+		const uploaded = await uploadImage(cookie, bytes, `${photo.file_id}.${ext}`);
+
+		const image: AcfunImage = {
+			url: uploaded.url,
+			width,
+			height,
+			size: bytes.length,
+			fileId: photo.file_id,
+			at: Date.now(),
+		};
+
+		// ⑤ 落库
+		const collection = await collectImage(deps.stateKv, chatId, image);
+		const count = collection.images.length;
+
+		// ⑥ 把回执「就地改写」成结果，而不是再发一条。
+		//    格式固定为：✅ [上传成功](原图) · 大小（n / 9）
+		//    「上传成功」本身是超链接，所以不再额外回显图片或直链。
+		const result =
+			`✅ ${imageLink(uploaded.url, "上传成功")} · ` +
+			`${formatBytes(bytes.length)}（${count} / ${QUOTA}）`;
+
+		if (targetId !== null) {
+			try {
+				// 不带 reply_markup：重试成功时顺手把按钮摘掉
+				await send.editText(targetId, result, { mode: "Markdown" });
+			} catch (error: any) {
+				// 编辑失败（消息太旧/已被删/内容未变）不该吞掉结果，退回发新消息
+				logger.warn("编辑回执失败，改为新发一条", { message: error?.message });
+				await send.sendText(result, { mode: "Markdown" });
+			}
+		} else {
+			await send.sendText(result, { mode: "Markdown" });
+		}
+
+		// ⑦ 凑满 9 张 → 直接发帖。这一跳约 2.3 秒，整个请求总计约 5 秒，远低于 Telegram 的 60 秒超时
+		if (count >= QUOTA) {
+			logger.info("收集已满，开始发帖", { count });
+			await flushIfReady({
+				stateKv: deps.stateKv,
+				cookieOverride: deps.cookieOverride,
+				// 丢掉 sendMessage 的返回值，只要 void
+				notify: async (id, text) => {
+					await ctx.telegram.sendMessage(id, text, { parse_mode: "Markdown" });
+				},
+			});
+		}
+	} catch (error: any) {
+		logger.error(fresh ? "照片处理失败" : "重试上传失败", {
+			message: error?.message,
+			rawMsg: error?.rawMsg,
+			chatId,
+			fresh,
+		});
+
+		// 失败就撤掉去重标记，**两条路径都要** —— 这是用户「手动兜底」的前提。
+		//
+		// ⚠️ 别只在首次失败时撤。重试失败后消息里写着「再点一次按钮」，
+		//    但用户很可能下意识地**把图重发一遍**；若标记还在，handlePhoto 会
+		//    判定「已处理过」直接静默 return，用户发出去的消息石沉大海 ——
+		//    既没有回复也没有报错，是最难排查的那种「没反应」。
+		//
+		// 只在真正走到上传这一步之后才撤：下载失败/体积超限这类根本还没上传，
+		// 撤了标记会让 Telegram 的重投有机会重新下载一遍。
+		//
+		// ⚠️ 键必须是 `file_unique_id`，与 handlePhoto 里 markSeen/hasSeen 完全一致；
+		//    写成 file_id 会删到一个不存在的键上，静默失效。
+		if (attempted) {
+			await deps.stateKv.delete(`seen:${photo.file_unique_id}`);
+		}
+
+		// 报错是**编辑**而不是新发消息 —— 与成功路径一致，聊天里不会多出第二条。
+		// ⚠️ 代价：Telegram 只对新消息推通知，编辑不推，所以上传失败时手机是安静的。
+		//    这是刻意接受的取舍（聊天整洁优先）。
+		//
+		// 引用块里只放**服务端返回的原始 error_msg**（如「服务器繁忙，请稍后再试」）；
+		// `getToken 失败:` 这类前缀是本项目自己拼的诊断信息，进了日志，不上屏。
+		const reason = String(error?.rawMsg ?? error?.message ?? error);
+		const text = `${htmlBlockquote(reason)}\n${retryHint(fresh)}`;
+
+		// 重试按钮：任何上传失败都给，因为超时/网络抖动同样能用重试救回来。
+		// callback_data 有 64 字节硬上限，所以这里只放短 token，参数存 KV（见 utils/retry）。
+		let replyMarkup: unknown;
+		try {
+			const token = await saveTicket(deps.stateKv, {
+				fileId: photo.file_id,
+				fileUniqueId: photo.file_unique_id,
+				// 用本轮实际探明的扩展名，重试时才能原样重建上传文件名
+				ext,
+				width,
+				height,
+				chatId,
+			});
+			replyMarkup = {
+				inline_keyboard: [[{ text: "🔄 重试", callback_data: retryCallbackData(token) }]],
+			};
+		} catch (ticketError: any) {
+			// 门票存不下不该让用户什么都收不到，退化成「不带按钮的报错」
+			logger.error("保存重试门票失败，本次不给按钮", { message: ticketError?.message });
+		}
+
+		if (targetId !== null) {
+			try {
+				await send.editText(targetId, text, { mode: "HTML", replyMarkup });
+			} catch (editError: any) {
+				logger.warn("编辑失败消息失败，改为新发一条", { message: editError?.message });
+				await send.sendText(text, { mode: "HTML" });
+			}
+		} else {
+			await send.sendText(text, { mode: "HTML" });
+		}
+	}
+}
+
+/**
+ * 处理一条带照片的消息 —— "一条进，一条出"（凑满 9 张时是第二条）。
  *
  * 流程（全部在这一次 Worker 调用内串行完成，约 3~5 秒）：
- *   1. 先回执 `📥 收到，正在上传…` —— 立刻发，此时这一张还没开始传
- *   2. 下载 → 上传 AcFun → 落库
- *   3. 回执 `✅ 第 N 张已存好 · X/9`
- *   4. 若凑满 9 张，就地发动态并回第 3 条（`✅ 已发布 9 图动态` + 链接）
+ *   1. 校验体积（先看元数据，必要时下载后再验）
+ *   2. 发回执 `📥 收到，正在上传…`
+ *   3. 下载 → 上传 AcFun → 落库
+ *   4. 回执**就地改写**成结果 `✅ [上传成功](原图) · 大小（n / 9）`
+ *   5. 若凑满 9 张，发一条新消息通报发帖结果
  *
  * 为什么全程串行、不用后台任务：
  *  - Telegraf 的 `Context` 没有 `waitUntil`（已核对 telegraf@4.16.3 的 typings 与源码），
@@ -214,14 +449,6 @@ export async function handlePhoto(ctx: Context, deps: PhotoDeps): Promise<void> 
 	const { photo, isDocument, mediaGroupId } = picked;
 
 	const chatId = message.chat.id;
-	// 统一走「先 Markdown、失败退纯文本」，避免任何一条消息因解析问题整条丢失
-	const send = (text: string) =>
-		sendWithFallback((t, parseMode, options) => {
-			const extra: any = {};
-			if (parseMode) extra.parse_mode = parseMode;
-			if (options?.disablePreview) extra.link_preview_options = { is_disabled: true };
-			return ctx.telegram.sendMessage(chatId, t, extra);
-		}, text);
 
 	// 白名单之外的人：完全不回应。
 	// 不回任何消息是刻意的 —— 让外人分不清这个 Bot 到底存不存在，也省掉被搭话的可能。
@@ -236,9 +463,7 @@ export async function handlePhoto(ctx: Context, deps: PhotoDeps): Promise<void> 
 		return;
 	}
 
-	// ① 立刻回执。相册（media_group）只回一条，避免刷屏。
-	//    ⚠️ 但这只是"收到了"——真正开始上传前还要过体积/格式校验，
-	//    所以在下载并验证通过后才会发（见下面），免得先发「正在上传」再报错。
+	// 相册（media_group）只回一条，避免刷屏
 	const albumKey = mediaGroupId !== undefined ? String(mediaGroupId) : null;
 	const shouldReceipt = !albumKey || !albumReceipted.has(albumKey);
 	if (albumKey) {
@@ -246,131 +471,98 @@ export async function handlePhoto(ctx: Context, deps: PhotoDeps): Promise<void> 
 		if (albumReceipted.size > 200) albumReceipted.clear();
 	}
 
-	// Telegram 元数据里就给了体积，超限的直接跳过，省掉一次下载
+	// Telegram 元数据里就给了体积，超限的直接跳过，省掉一次下载。
+	// 顺带说明：这里也故意不发回执 —— 回执的含义是「这张开始传了」，
+	// 而超限的图根本不会开始传（见文件头的交互说明）。
 	if (photo.file_size && photo.file_size > MAX_BYTES) {
-		await send(oversizeHint(photo.file_size));
+		await makeSender(ctx, chatId).sendText(oversizeHint(photo.file_size));
 		return;
 	}
 
 	// 先标记已见，避免上传中途重投造成重复上传
 	await markSeen(deps.stateKv, photo.file_unique_id);
 
-	// 回执消息的 message_id。拿到它之后，上传结果就用「编辑这条消息」呈现，
-	// 而不是再发一条 —— 见文件头的交互说明。
-	let receiptId: number | null = null;
+	// `fresh = shouldReceipt`：相册里除第一张之外不再单独发回执，
+	// 但依然会正常上传、正常落库（只是没有那条「正在上传…」消息可改写，结果会新发一条）。
+	await runUpload(
+		ctx,
+		chatId,
+		{
+			file_id: photo.file_id,
+			file_unique_id: photo.file_unique_id,
+			width: photo.width,
+			height: photo.height,
+		},
+		isDocument,
+		shouldReceipt,
+		null,
+		deps,
+	);
+}
 
-	/**
-	 * 发回执并记下 message_id（失败时返回 null，不抛）。
-	 *
-	 * 回执是纯静态文本、不含任何链接，所以**故意不带 parse_mode** ——
-	 * 没必要为它承担 Markdown 解析失败的风险，它也绝不会因此整条丢失。
-	 * 后面的结果消息因为有超链接才需要 Markdown（并走 sendWithFallback 兜底）。
-	 */
-	const sendTracked = async (text: string): Promise<number | null> => {
-		try {
-			const sent = await ctx.telegram.sendMessage(chatId, text);
-			return sent?.message_id ?? null;
-		} catch (error: any) {
-			logger.error("发送消息失败", { message: error?.message });
-			return null;
-		}
-	};
+/**
+ * 处理「🔄 重试」按钮 —— `bot.action(/^retry:/)` 的回调。
+ *
+ * 顺序上有一条硬约束：Telegram 要求 `answerCallbackQuery` 在 **3 秒**内应答
+ * （否则客户端一直转圈），而上传要 3~5 秒。所以**先应答、再干活**，绝不能反过来。
+ *
+ * 门票消费即作废，所以连点两下只有第一次能拿到 ticket：第二次读到 null，
+ * 走「已失效」分支 —— 天然防重复上传，不需要额外的锁。
+ */
+export async function handleRetry(
+	ctx: Context,
+	token: string,
+	deps: PhotoDeps,
+): Promise<void> {
+	// 先应答，消掉客户端那个转圈。整个流程只应答一次 ——
+	// 第二次 answerCallbackQuery 会被 Telegram 拒（query 已被消费）。
+	await ctx.answerCbQuery("收到，重试中…");
 
-	try {
-		// ② 下载
-		const link = await ctx.telegram.getFileLink(photo.file_id);
-		const res = await fetch(link.toString());
-		if (!res.ok) throw new Error(`下载失败 HTTP ${res.status}`);
-		const bytes = new Uint8Array(await res.arrayBuffer());
-
-		if (bytes.length > MAX_BYTES) {
-			await send(oversizeHint(bytes.length));
-			return;
-		}
-
-		// ③ 尺寸。
-		//    `photo` 路径 Telegram 直接给了宽高；`document` 路径（转发常见）没有，
-		//    只能从文件头读，顺便认出真实格式 —— 扩展名会影响 AcFun 返回的直链后缀。
-		let width = photo.width;
-		let height = photo.height;
-		let ext = "jpg";
-		if (isDocument || !width || !height) {
-			const size = imageSize(bytes);
-			if (!size) {
-				await send(
-					"⚠️ 认不出这个图片格式（支持 JPEG / PNG / WebP），AcFun 的接口需要宽高。\n" +
-						"可以改用「照片」方式发送，或先转成 JPEG。",
-				);
-				return;
-			}
-			({ width, height } = size);
-			ext = size.ext;
-		}
-
-		if (shouldReceipt) {
-			receiptId = await sendTracked("📥 收到，正在上传…");
-		}
-
-		// ④ 上传 AcFun，换持久直链（5 个子请求）
-		const cookie = buildCookie(
-			await getAcfunToken(deps.stateKv, deps.cookieOverride),
-		);
-		const uploaded = await uploadImage(cookie, bytes, `${photo.file_unique_id}.${ext}`);
-
-		const image: AcfunImage = {
-			url: uploaded.url,
-			width,
-			height,
-			size: bytes.length,
-			fileId: photo.file_unique_id,
-			at: Date.now(),
-		};
-
-		// ⑤ 落库
-		const collection = await collectImage(deps.stateKv, chatId, image);
-		const count = collection.images.length;
-
-		// ⑥ 把回执「就地改写」成结果，而不是再发一条。
-		//    格式固定为：✅ [上传成功](原图) · 大小（n / 9）
-		//    「上传成功」本身是超链接，所以不再额外回显图片或直链。
-		const result =
-			`✅ ${imageLink(uploaded.url, "上传成功")} · ` +
-			`${formatBytes(bytes.length)}（${count} / ${QUOTA}）`;
-
-		if (receiptId !== null) {
-			try {
-				await ctx.telegram.editMessageText(chatId, receiptId, undefined, result, {
-					parse_mode: "Markdown",
-					// 这是用户自己的梗图，弹预览既刷屏又剧透
-					link_preview_options: { is_disabled: true },
-				} as any);
-			} catch (error: any) {
-				// 编辑失败（消息太旧/已被删/内容未变）不该吞掉结果，退回发新消息
-				logger.warn("编辑回执失败，改为新发一条", { message: error?.message });
-				await send(result);
-			}
-		} else {
-			await send(result);
-		}
-
-		// ⑦ 凑满 9 张 → 直接发帖。这一跳约 2.3 秒，整个请求总计约 5 秒，远低于 Telegram 的 60 秒超时
-		if (count >= QUOTA) {
-			logger.info("收集已满，开始发帖", { count });
-			await flushIfReady({
-				stateKv: deps.stateKv,
-				cookieOverride: deps.cookieOverride,
-				// 丢掉 sendMessage 的返回值，只要 void
-				notify: async (id, text) => {
-					await ctx.telegram.sendMessage(id, text, { parse_mode: "Markdown" });
-				},
-			});
-		}
-	} catch (error: any) {
-		logger.error("照片处理失败", { message: error?.message, chatId });
-		// 失败就撤掉去重标记，允许用户直接重发这张图
-		await deps.stateKv.delete(`seen:${photo.file_unique_id}`);
-		await send(`❌ 这张上传失败：${escapeMarkdown(describe(error))}\n把这张图重发一次即可。`);
+	const ticket: RetryTicket | null = await consumeTicket(deps.stateKv, token);
+	if (!ticket) {
+		logger.warn("重试门票无效（已用过或已过期）", { token });
+		return;
 	}
+
+	const chatId = ctx.chat?.id;
+	if (deps.ownerChatId && chatId !== deps.ownerChatId) {
+		logger.warn("非白名单 chat 点重试，静默丢弃", { chatId });
+		return;
+	}
+
+	logger.info("收到重试请求", { chatId, fileId: ticket.fileId });
+
+	// 和首次上传一样先立标记，避免重试期间的重投造成重复上传。
+	// ⚠️ 键用的是 fileUniqueId（与 handlePhoto 一致），不是 fileId。
+	await markSeen(deps.stateKv, ticket.fileUniqueId);
+
+	// 失败消息挂在 callback_query.message 上。
+	// ⚠️ 不能读 `ctx.message` —— 回调型 update 里 Telegraf 不会填它（只有 callbackQuery.message），
+	//    读了会永远得到 null，于是重试结果退化成「再发一条新消息」，
+	//    用户看到的就不再是「同一条就地更新」了。
+	const cbMessage = ctx.callbackQuery?.message;
+	const messageId =
+		cbMessage && typeof cbMessage === "object" && "message_id" in cbMessage
+			? (cbMessage as { message_id: number }).message_id
+			: null;
+
+	await runUpload(
+		ctx,
+		ticket.chatId,
+		{
+			// Telegram 的 file_id 长期有效，直接拿它重新下载；宽高首次已解析好，
+			// 所以 isDocument 传 false 也不会触发文件头解析（宽高齐全）。
+			file_id: ticket.fileId,
+			file_unique_id: ticket.fileUniqueId,
+			width: ticket.width,
+			height: ticket.height,
+		},
+		false,
+		// fresh = false：复用那条失败消息，不新发回执
+		false,
+		messageId,
+		deps,
+	);
 }
 
 const oversizeHint = (size: number) =>

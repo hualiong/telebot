@@ -23,6 +23,13 @@ import { Bot } from "../src/bot";
 
 const OWNER = 1971332015;
 
+/**
+ * 假 AcFun 返回的错误文案。刻意用真实观测到的措辞：
+ * AcFun 把给用户看的一句话放在 `error_msg` 里，result 码另放 ——
+ * 界面上只该出现这句话，而 `getToken 失败:` 是本项目自己拼的前缀。
+ */
+const ACFUN_ERROR_TEXT = "服务器繁忙，请稍后再试";
+
 // Telegraf 是 CJS，bundler 输出 ESM 时它的 require('crypto') 会炸；
 // 所以输出 CJS，并把带顶层 await 的主体包进 async IIFE。
 async function main() {
@@ -89,7 +96,11 @@ function startFakeTelegram(calls, fileBytes) {
 				return send({ ok: true, result: { message_id: id, date: 0, chat: { id: payload.chat_id, type: "private" }, text: payload.text } });
 			}
 			if (method === "editMessageText") {
-				return send({ ok: true, result: { message_id: Number(payload.message_id), date: 0, chat: { id: payload.chat_id, type: "private" }, text: payload.text } });
+				// 回显 reply_markup：重试按钮就挂在这个字段上，断言要用
+				return send({ ok: true, result: { message_id: Number(payload.message_id), date: 0, chat: { id: payload.chat_id, type: "private" }, text: payload.text, reply_markup: payload.reply_markup } });
+			}
+			if (method === "answerCallbackQuery") {
+				return send({ ok: true, result: true });
 			}
 			return send({ ok: true, result: {} });
 		};
@@ -143,6 +154,11 @@ const check = (label, cond, extra = "") => {
  * 两个拦截点：
  *  1. `telegram.callApi`（实例级）—— 覆盖所有 Telegram REST 调用
  *  2. `globalThis.fetch` —— 覆盖图片下载与 AcFun 调用
+ *
+ * `opts.update` 可以直接喂一整条 update（用来测按钮回调），
+ * 不传时用 `message` 包一条普通消息。
+ * `opts.acfunFails` 让假 AcFun 的 getToken 返回错误（result 27），
+ * 用来复现「上传失败」这条路径。
  */
 async function run(label, message, opts = {}) {
 	const calls = [];
@@ -168,7 +184,11 @@ async function run(label, message, opts = {}) {
 		// 假 AcFun（图片下载由本地假 Telegram 直接返回，不走这里）
 		if (url.includes("acfun") || url.includes("kuaishouzt")) {
 			const json = (o) => new Response(JSON.stringify(o), { status: 200, headers: { "Content-Type": "application/json" } });
-			if (url.includes("getToken")) return json({ result: 0, info: { token: "T" } });
+			if (url.includes("getToken")) {
+				// 限流/伺服繁忙：AcFun 就是把文案放在 error_msg 里，result 27
+				if (opts.acfunFails) return json({ result: 27, error_msg: ACFUN_ERROR_TEXT });
+				return json({ result: 0, info: { token: "T" } });
+			}
 			if (url.includes("getUrlAfterUpload")) {
 				return json({ result: 0, url: `https://imgs.aixifan.com/newUpload/1_abc.${opts.expectExt ?? "jpg"}` });
 			}
@@ -185,7 +205,8 @@ async function run(label, message, opts = {}) {
 	};
 
 	try {
-		await bot.handleWebhook({ update_id: Math.floor(Math.random() * 1e6), message });
+		const update = opts.update ?? { update_id: Math.floor(Math.random() * 1e6), message };
+		await bot.handleWebhook(update);
 	} finally {
 		globalThis.fetch = realFetch;
 		await fake.close();
@@ -195,8 +216,19 @@ async function run(label, message, opts = {}) {
 	 * 按时间顺序重建聊天。
 	 * Telegraf 每次 handleUpdate 都会自己调一次 getMe（缓存 botInfo），
 	 * 那是它内部行为，不算「Bot 回了消息」，所以断言时用 business 过滤掉。
+	 *
+	 * `buttons` 记录每条消息当前挂着的按钮（回调里的 callback_data），
+	 * 用来验证「失败时挂上重试按钮、成功后摘掉」。
+	 *
+	 * `opts.seedMessage`：把一条「已存在的消息」先放进聊天里。
+	 * 测按钮回调时必须这样 —— 那条失败消息是**上一次** Worker 调用发的，
+	 * 本次假 Telegram 里本来不存在，不预置的话 editMessageText 会打在空气上。
 	 */
 	const chat = [];
+	if (opts.seedMessage) {
+		chat.push({ id: opts.seedMessage.message_id, text: opts.seedMessage.text ?? "" });
+	}
+	const buttons = new Map();
 	for (const c of calls) {
 		if (c.method === "sendMessage") chat.push({ id: c.resultId, text: c.payload?.text ?? "" });
 		if (c.method === "editMessageText") {
@@ -204,8 +236,18 @@ async function run(label, message, opts = {}) {
 			if (target) target.text = c.payload.text ?? "";
 		}
 	}
+	for (const c of calls) {
+		if (c.method !== "sendMessage" && c.method !== "editMessageText") continue;
+		const id = c.method === "sendMessage" ? c.resultId : Number(c.payload?.message_id);
+		const rows = c.payload?.reply_markup?.inline_keyboard;
+		const data = rows?.[0]?.[0]?.callback_data;
+		if (data) buttons.set(id, data);
+		else buttons.delete(id);
+	}
+
 	const sends = calls.filter((c) => c.method === "sendMessage").map((c) => c.payload?.text ?? "");
 	const edits = calls.filter((c) => c.method === "editMessageText").map((c) => c.payload?.text ?? "");
+	const editPayloads = calls.filter((c) => c.method === "editMessageText").map((c) => c.payload ?? {});
 	const visible = chat.map((m) => m.text);
 	// 排除 Telegraf 自己的 getMe，只看「业务上真的发了什么」
 	const business = calls.filter((c) => c.method !== "getMe");
@@ -217,7 +259,7 @@ async function run(label, message, opts = {}) {
 	}
 	if (!calls.length) console.log("   （零调用）");
 	console.log(`   state=${JSON.stringify(await stateKv.get("acfun:collection"))}`);
-	return { calls, business, sends, edits, visible, stateKv };
+	return { calls, business, sends, edits, editPayloads, visible, buttons, stateKv };
 }
 
 const baseMsg = (extra, chatId = OWNER) => ({
@@ -328,6 +370,194 @@ const cmd = (text) => ({ text, entities: [{ type: "bot_command", offset: 0, leng
 	check("发布文案为「🎉 新动态已发布 · 查看」", /🎉 \*新动态已发布\* · \[查看\]\(https:\/\/m\.acfun\.cn\//.test(published), JSON.stringify(published));
 	check("不再出现「已发布 9 图动态」", !sends.some((s) => s.includes("9 图动态")));
 	check("不再出现「在 AcFun 查看」", !sends.some((s) => s.includes("在 AcFun 查看")));
+}
+
+// ---- 9. 上传失败：就地编辑（不新发消息）+ 引用块 + 重试按钮 ----
+// 这一组是本次改动的主战场：失败必须走「编辑」，文案必须只含服务端原始 msg，
+// 并且必须挂上重试按钮 —— 三件事缺一件用户就看不到可点的重试。
+let retryToken = null;
+let failureStateKv = null;
+{
+	const stateKv = makeKv();
+	failureStateKv = stateKv;
+	const { sends, edits, editPayloads, visible, buttons } = await run(
+		"上传失败（AcFun getToken 报错）",
+		baseMsg({ photo: [{ file_id: "FAILFILE", file_unique_id: "fail1", width: 800, height: 600, file_size: 9000 }] }),
+		{ stateKv, acfunFails: true },
+	);
+
+	// 成功路径是「1 条回执 + 1 次编辑」，失败路径必须同样是这个形状：
+	// 只发回执那一条，报错靠编辑呈现，聊天里不出现第二条消息。
+	check("失败时只发了回执一条 sendMessage", sends.length === 1, `实际 ${sends.length} 条: ${JSON.stringify(sends)}`);
+	check("报错用 editMessageText 而非新消息", edits.length === 1, `编辑 ${edits.length} 次`);
+	check("聊天里只留下一条消息（没有多出报错条）", visible.length === 1, `实际 ${visible.length} 条`);
+
+	const errText = edits[0] ?? "";
+	check("引用块用 HTML 的 <blockquote>", /<blockquote>[\s\S]*<\/blockquote>/.test(errText), JSON.stringify(errText));
+	check("引用块里是服务端原始 error_msg", errText.includes(ACFUN_ERROR_TEXT), JSON.stringify(errText));
+	check("不带代码自己拼的「getToken 失败」前缀", !errText.includes("getToken 失败"), JSON.stringify(errText));
+	check("带上「重发一次」的提示", errText.includes("把这张图重发一次即可"), JSON.stringify(errText));
+	check("错误消息用 HTML 解析模式", editPayloads[0]?.parse_mode === "HTML", JSON.stringify(editPayloads[0]?.parse_mode));
+
+	// 重试按钮
+	const markup = editPayloads[0]?.reply_markup;
+	const btn = markup?.inline_keyboard?.[0]?.[0];
+	check("失败消息挂上了重试按钮", !!btn, JSON.stringify(markup));
+	check("按钮文案是「🔄 重试」", btn?.text === "🔄 重试", JSON.stringify(btn?.text));
+	check("callback_data 形如 retry:<16hex>", /^retry:[0-9a-f]{16}$/.test(btn?.callback_data ?? ""), JSON.stringify(btn?.callback_data));
+	// Telegram 的硬限制：callback_data 最多 64 字节。file_id 塞不进按钮，
+	// 所以这里必须只是短 token —— 这条断言守住那个设计约束。
+	check("callback_data ≤ 64 字节", Buffer.byteLength(btn?.callback_data ?? "", "utf8") <= 64,
+		`实际 ${Buffer.byteLength(btn?.callback_data ?? "", "utf8")} 字节`);
+
+	// 失败后要撤掉去重标记，用户重发同一张图才能重新走一遍
+	check("失败后撤掉了 seen 标记（可重发）", (await stateKv.get("seen:fail1")) === null,
+		`seen:fail1=${await stateKv.get("seen:fail1")}`);
+	check("失败没有往收集里写脏数据",
+		(await stateKv.get("acfun:collection")) === null,
+		String(await stateKv.get("acfun:collection")));
+
+	retryToken = btn?.callback_data?.split(":")[1] ?? null;
+}
+
+// ---- 10. 点击「🔄 重试」：复用那条消息，成功后按钮消失 ----
+{
+	const stateKv = failureStateKv;
+	// 那条失败消息是上一次 Worker 调用发出的（首条 sendMessage ⇒ id=101）。
+	// 本次是新的一次 handleUpdate，所以要在假 Telegram 里把它预置出来，
+	// 否则 editMessageText 会打在一条不存在的消息上。
+	const failedMessage = { message_id: 101, date: 0, chat: { id: OWNER, type: "private" }, text: "旧的报错内容" };
+	const cbUpdate = {
+		update_id: 990001,
+		callback_query: {
+			id: "cb-1",
+			from: { id: OWNER, is_bot: false, first_name: "p" },
+			chat_instance: "ci",
+			data: `retry:${retryToken}`,
+			message: failedMessage,
+		},
+	};
+
+	const { calls, edits, sends, buttons, visible, stateKv: kvAfter } = await run(
+		"点击重试（AcFun 已恢复）",
+		null,
+		{ stateKv, update: cbUpdate, seedMessage: failedMessage },
+	);
+
+	check("先应答回调（3 秒死线）", calls.some((c) => c.method === "answerCallbackQuery"),
+		JSON.stringify(calls.map((c) => c.method)));
+	check("重试没有新发消息（只在旧消息上编辑）", sends.length === 0, `实际 ${sends.length} 条: ${JSON.stringify(sends)}`);
+	const okEdit = edits.find((t) => t.includes("上传成功")) ?? "";
+	check("重试成功后那条消息变成上传结果", /^✅ \[上传成功\]\(https:\/\//.test(okEdit), JSON.stringify(okEdit));
+	check("重试成功顺手摘掉了按钮", buttons.get(101) === undefined, JSON.stringify([...buttons]));
+	check("成功后聊天里仍只有一条消息", visible.length === 1, `实际 ${visible.length} 条`);
+	check("留下的那条就是上传结果", (visible[0] ?? "").includes("上传成功"), JSON.stringify(visible[0]));
+
+	const col = JSON.parse(await kvAfter.get("acfun:collection"));
+	check("重试成功后落库 1 张", col.images.length === 1, `实际 ${col.images.length} 张`);
+	// 幂等键必须是 file_unique_id —— 用 file_id 会写到没人查的键上，去重静默失效
+	check("幂等标记写在 file_unique_id 上", (await kvAfter.get("seen:fail1")) !== null,
+		`seen:fail1=${await kvAfter.get("seen:fail1")}`);
+	check("重试门票已作废（不可再用）",
+		(await kvAfter.get(`retry:${retryToken}`)) === null,
+		String(await kvAfter.get(`retry:${retryToken}`)));
+}
+
+// ---- 11. 重试门票只能用一次（连点两下不会重复上传）----
+{
+	const stateKv = failureStateKv;
+	const cbUpdate = {
+		update_id: 990002,
+		callback_query: {
+			id: "cb-2",
+			from: { id: OWNER, is_bot: false, first_name: "p" },
+			chat_instance: "ci",
+			data: `retry:${retryToken}`,
+			message: {
+				message_id: 101,
+				date: 0,
+				chat: { id: OWNER, type: "private" },
+				text: "已经是上传结果了",
+			},
+		},
+	};
+	const { sends, edits, stateKv: kvAfter } = await run("重复点同一个重试按钮", null, { stateKv, update: cbUpdate });
+
+	check("重复点击不产生任何上传动作", sends.length === 0 && edits.length === 0,
+		`sends=${sends.length} edits=${edits.length}`);
+	const col = JSON.parse(await kvAfter.get("acfun:collection"));
+	check("收集里依然只有 1 张（没有重复上传）", col.images.length === 1, `实际 ${col.images.length} 张`);
+}
+
+// ---- 12. 重试仍然失败：消息继续就地更新，并挂上新的重试按钮 ----
+// 这就是用户实际最常遇到的情形：AcFun 限流持续几分钟，点一次重试还是失败。
+{
+	const token = "0011223344556677";
+	const stateKv = makeKv();
+	await stateKv.put("token", "FAKE-TOKEN-FOR-TEST");
+	await stateKv.put(`retry:${token}`, JSON.stringify({
+		fileId: "FAILFILE", fileUniqueId: "fail3", ext: "jpg", width: 800, height: 600, chatId: OWNER,
+	}));
+	const errMsg = { message_id: 700, date: 0, chat: { id: OWNER, type: "private" }, text: "旧报错" };
+
+	const { sends, edits, editPayloads, buttons, visible } = await run(
+		"点重试仍然失败",
+		null,
+		{
+			stateKv,
+			acfunFails: true,
+			seedMessage: errMsg,
+			update: {
+				update_id: 990004,
+				callback_query: {
+					id: "cb-4",
+					from: { id: OWNER, is_bot: false, first_name: "p" },
+					chat_instance: "ci",
+					data: `retry:${token}`,
+					message: errMsg,
+				},
+			},
+		},
+	);
+
+	check("重试失败也不新发消息", sends.length === 0, `实际 ${sends.length} 条: ${JSON.stringify(sends)}`);
+	const again = edits[0] ?? "";
+	check("失败消息被就地更新", (visible[0] ?? "").includes("重试"), JSON.stringify(visible));
+	check("文案改成「再点一次按钮」", again.includes("再点一次上面的按钮即可重试"), JSON.stringify(again));
+	check("引用块里仍是服务端原始 msg", again.includes(ACFUN_ERROR_TEXT), JSON.stringify(again));
+	const btn = editPayloads[0]?.reply_markup?.inline_keyboard?.[0]?.[0];
+	check("重新挂上了一个新的重试按钮", /^retry:[0-9a-f]{16}$/.test(btn?.callback_data ?? ""),
+		JSON.stringify(btn?.callback_data));
+	check("新 token 与旧 token 不同", btn?.callback_data !== `retry:${token}`, JSON.stringify(btn?.callback_data));
+	check("旧门票已作废", (await stateKv.get(`retry:${token}`)) === null);
+	check("失败后 seen 标记被撤掉（还能继续重试）", (await stateKv.get("seen:fail3")) === null,
+		`seen:fail3=${await stateKv.get("seen:fail3")}`);
+	check("本次失败没有落库", (await stateKv.get("acfun:collection")) === null);
+}
+
+// ---- 13. 陌生人点重试：静默，且不消费门票 ----
+{
+	// 用一张**新的**失败门票，验证非白名单点击既不上传、也不把票烧掉
+	const token = "abcdef0123456789";
+	const stateKv = makeKv();
+	await stateKv.put(`retry:${token}`, JSON.stringify({
+		fileId: "FAILFILE", fileUniqueId: "fail2", ext: "jpg", width: 800, height: 600, chatId: 999000001,
+	}));
+
+	const cbUpdate = {
+		update_id: 990003,
+		callback_query: {
+			id: "cb-3",
+			from: { id: 999000001, is_bot: false, first_name: "x" },
+			chat_instance: "ci2",
+			data: `retry:${token}`,
+			message: { message_id: 500, date: 0, chat: { id: 999000001, type: "private" }, text: "报错" },
+		},
+	};
+	const { sends, edits } = await run("陌生人点重试", null, { stateKv, update: cbUpdate });
+
+	check("陌生人点重试 → 不上传、不改消息", sends.length === 0 && edits.length === 0,
+		`sends=${sends.length} edits=${edits.length}`);
 }
 
 console.log(`\n${pass ? "✅ 全部通过" : "❌ 有失败项"}`);

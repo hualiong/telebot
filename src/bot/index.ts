@@ -35,6 +35,7 @@ export class Bot {
 		registerCommands(this.telegraf, {
 			stateKv: deps.stateKv,
 			ownerChatId: deps.ownerChatId,
+			cookieOverride: deps.cookieOverride,
 			flush: (content) => this.flush(content),
 		});
 	}

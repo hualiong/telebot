@@ -105,6 +105,29 @@ const describeFailure = (j: any): string => {
 	return `${j?.result ?? "?"} ${j?.error_msg ?? ""}`.trim();
 };
 
+/**
+ * 取服务端响应里的**原始错误文案**，不做任何加工。
+ *
+ * `describeFailure()` 是给日志和 CLI 看的（它把 result 码拼在前面，比如
+ * `27 服务器繁忙，请稍后再试`）；而 `error_msg` 本身就是给用户看的一句话
+ * （限流时是「服务器繁忙，请稍后再试」）。用户界面上只该出现后者 ——
+ * 于是这里把它单独摘出来挂在 Error 上，让消息层取用，而**不动 message 本身**，
+ * 免得影响既有日志与 `acfun-smoke.mjs` 的输出。
+ */
+const rawMessageOf = (j: any): string | undefined =>
+	typeof j?.error_msg === "string" && j.error_msg.trim() ? j.error_msg.trim() : undefined;
+
+/**
+ * 抛一个带「原始文案」的错误。沿用 `postMoment` 里既有的范式
+ * （那边挂的是 `err.result`，这里挂 `err.rawMsg`）。
+ */
+function fail(prefix: string, j: any): never {
+	const err: any = new Error(`${prefix}: ${describeFailure(j)}`);
+	err.rawMsg = rawMessageOf(j);
+	if (j?.result !== undefined) err.result = j.result;
+	throw err;
+}
+
 /** ① 取上传凭证。PC 端点，multipart，只放 fileName。 */
 async function getUploadToken(cookie: string, fileName: string): Promise<string> {
 	const fd = new FormData();
@@ -116,7 +139,7 @@ async function getUploadToken(cookie: string, fileName: string): Promise<string>
 	});
 	const j: any = await r.json();
 	if (j.result !== 0 || !j.info?.token) {
-		throw new Error(`getToken 失败: ${describeFailure(j)}`);
+		fail("getToken 失败", j);
 	}
 	return j.info.token as string;
 }
@@ -158,7 +181,7 @@ async function uploadFragment(
 	);
 	const j: any = await r.json();
 	if (j.result !== 1) {
-		throw new Error(`fragment ${id} 失败: ${describeFailure(j)}`);
+		fail(`fragment ${id} 失败`, j);
 	}
 }
 
@@ -170,7 +193,7 @@ async function completeUpload(token: string, count: number): Promise<void> {
 	);
 	const j: any = await r.json();
 	if (j.result !== 1) {
-		throw new Error(`complete 失败: ${describeFailure(j)}`);
+		fail("complete 失败", j);
 	}
 }
 
@@ -186,7 +209,7 @@ async function getPersistentUrl(cookie: string, token: string): Promise<string> 
 	});
 	const j: any = await r.json();
 	if (j.result !== 0 || !j.url) {
-		throw new Error(`getUrlAfterUpload 失败: ${describeFailure(j)}`);
+		fail("getUrlAfterUpload 失败", j);
 	}
 	// 防御：拿到 preview 链就说明端点用错了，宁可直接报错也不要把会过期的链存进 KV
 	if (/preview\./.test(j.url)) {

@@ -4,7 +4,8 @@ import { DEFAULT_CONTENT } from "../services/acfun";
 import { loadCollection, resetCollection } from "../services/collection";
 import { QUOTA } from "../services/poster";
 import { sendWithFallback } from "../utils/markdown";
-import { describeCollection } from "./photo";
+import { RETRY_CALLBACK_PATTERN } from "../utils/retry";
+import { describeCollection, handleRetry } from "./photo";
 import { logger } from "../utils/logger";
 
 /** 命令处理器需要的依赖。 */
@@ -13,6 +14,8 @@ export interface CommandDeps {
 	ownerChatId?: number;
 	/** 触发一次发帖流程；结果由 poster 自己通过 Telegram 回报 */
 	flush: (content?: string) => Promise<void>;
+	/** 本地调试时覆盖凭证 */
+	cookieOverride?: string;
 }
 
 /**
@@ -29,6 +32,10 @@ export function registerCommands(bot: Telegraf, deps: CommandDeps): void {
 	bot.command("status", (ctx) => withOwner(ctx, deps, (c) => handleStatus(c, deps)));
 	bot.command("post", (ctx) => withOwner(ctx, deps, (c) => handlePost(c, deps)));
 	bot.command("clear", (ctx) => withOwner(ctx, deps, (c) => handleClear(c, deps)));
+
+	// 「🔄 重试」按钮。⚠️ 这是**新的对外入口**，必须和命令一样过 withOwner，
+	// 否则外人只要猜到 token 就能触发上传，白名单就形同虚设。
+	bot.action(RETRY_CALLBACK_PATTERN, (ctx) => withOwner(ctx, deps, (c) => handleRetryAction(c, deps)));
 
 	// 兜底：非命令、非图片的文本
 	bot.on("message", (ctx) => withOwner(ctx, deps, handleMessage));
@@ -54,6 +61,26 @@ async function withOwner(
 		return;
 	}
 	await handler(ctx);
+}
+
+/**
+ * 「🔄 重试」按钮的回调。
+ *
+ * 从 callback_data 里解出 token 后交给 `handleRetry`（它负责应答、换门票、重跑上传）。
+ * 匹配式本身保证了组 1 一定存在，但类型上 `match` 可能是 undefined，这里显式收窄。
+ */
+async function handleRetryAction(ctx: Context, deps: CommandDeps): Promise<void> {
+	const match = (ctx as any).match as RegExpMatchArray | undefined;
+	const token = match?.[1];
+	if (!token) {
+		logger.warn("重试回调没有解析出 token，忽略");
+		return;
+	}
+	await handleRetry(ctx, token, {
+		stateKv: deps.stateKv,
+		cookieOverride: deps.cookieOverride,
+		ownerChatId: deps.ownerChatId,
+	});
 }
 
 async function handleStart(ctx: Context): Promise<void> {
@@ -101,16 +128,7 @@ async function handleHelp(ctx: Context): Promise<void> {
 async function handleStatus(ctx: Context, deps: CommandDeps): Promise<void> {
 	const { text } = await describeCollection(deps.stateKv);
 	// Markdown 是为了让「预览」变成可点开的直链；关掉预览免得 9 张图刷屏
-	await sendWithFallback(
-		(t, parseMode, options) => {
-			const extra: any = {};
-			if (parseMode) extra.parse_mode = parseMode;
-			if (options?.disablePreview) extra.link_preview_options = { is_disabled: true };
-			return ctx.reply(t, extra);
-		},
-		text,
-		{ disablePreview: true },
-	);
+	await sendWithFallback((t, extra) => ctx.reply(t, extra as any), text);
 }
 
 async function handlePost(ctx: Context, deps: CommandDeps): Promise<void> {
